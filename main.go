@@ -17,188 +17,96 @@
 package main
 
 import (
-	"encoding/json"
-	"io/ioutil"
+	"context"
+	"log"
 	"net/http"
-	"strings"
-	"time"
+	"os"
+	"recipes-api/handlers"
 
+	"github.com/gin-contrib/sessions"
+	redisStore "github.com/gin-contrib/sessions/redis"
 	"github.com/gin-gonic/gin"
-	"github.com/rs/xid"
+	"github.com/go-redis/redis/v8"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/mongo/readpref"
 )
 
-type Recipe struct {
-	ID           string    `json:"id"`
-	Name         string    `json:"name"`
-	Tags         []string  `json:"tags"`
-	Ingredients  []string  `json:"ingredients"`
-	Instructions []string  `json:"instructions"`
-	PublishedAt  time.Time `json:"publishedAt"`
-}
-
-// swagger:operation POST /recipes recipes createRecipe
-// Returns newly created recipe
-// ---
-// produces:
-// - application/json
-// responses:
-//     '200':
-//         description: Successful operation
-func NewRecipeHandler(c *gin.Context) {
-	var recipe Recipe
-
-	if err := c.ShouldBindJSON(&recipe); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": err.Error()})
-		return
-	}
-	recipe.ID = xid.New().String()
-	recipe.PublishedAt = time.Now()
-	recipes = append(recipes, recipe)
-	c.JSON(http.StatusOK, recipe)
-}
-
-// swagger:operation GET /recipes recipes listRecipes
-// Returns list of recipes
-// ---
-// produces:
-// - application/json
-// responses:
-//     '200':
-//         description: Successful operation
-func ListRecipesHandler(c *gin.Context) {
-	c.JSON(http.StatusOK, recipes)
-}
-
-// swagger:operation PUT /recipes/{id} recipes updateRecipe
-// Update an existing recipe
-// ---
-// parameters:
-// - name: id
-//   in: path
-//   description: ID of the recipe
-//   required: true
-//   type: string
-// produces:
-// - application/json
-// responses:
-//     '200':
-//         description: Successful operation
-//     '400':
-//         description: Invalid input
-//     '404':
-//         description: Invalid recipe ID
-func UpdateRecipeHandler(c *gin.Context) {
-	id := c.Param("id")
-	var recipe Recipe
-	if err := c.ShouldBindJSON(&recipe); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	index := 1
-	for i := 0; i < len(recipes); i++ {
-		if recipes[i].ID == id {
-			index = i
-		}
-	}
-	if index == -1 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Recipe not found"})
-		return
-	}
-	recipes[index] = recipe
-	c.JSON(http.StatusOK, recipe)
-}
-
-// swagger:operation DELETE /recipes/{id} recipes deleteRecipe
-// Delete an existing recipe
-// ---
-// parameters:
-// - name: id
-//   in: path
-//   description: ID of the recipe
-//   required: true
-//   type: string
-// produces:
-// - application/json
-// responses:
-//     '200':
-//         description: Successful operation
-//     '400':
-//         description: Invalid input
-//     '404':
-//         description: Invalid recipe ID
-func DeleteRecipeHandler(c *gin.Context) {
-	id := c.Param("id")
-	index := -1
-	for i := 0; i < len(recipes); i++ {
-		if recipes[i].ID == id {
-			index = i
-		}
-	}
-
-	if index == -1 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Recipe not found"})
-		return
-	}
-
-	recipes = append(recipes[:index], recipes[index+1:]...)
-	c.JSON(http.StatusOK, gin.H{"message": "Recipe has been deleted"})
-}
-
-// swagger:operation GET /recipes/search?tag recipes findRecipe
-// Update an existing recipe
-// ---
-// parameters:
-// - name: id
-//   in: path
-//   description: ID of the recipe
-//   required: true
-//   type: string
-// - name: search
-//   in: query
-//   required: true
-//   type: string
-// produces:
-// - application/json
-// responses:
-//     '200':
-//         description: Successful operation
-//     '400':
-//         description: Invalid input
-//     '404':
-//         description: Invalid recipe ID
-func SearchRecipesHandler(c *gin.Context) {
-	tag := c.Query("tag")
-	listOfRecipes := make([]Recipe, 0)
-
-	for i := 0; i < len(recipes); i++ {
-		found := false
-		for _, t := range recipes[i].Tags {
-			if strings.EqualFold(t, tag) {
-				found = true
-			}
-		}
-		if found {
-			listOfRecipes = append(listOfRecipes, recipes[i])
-		}
-	}
-	c.JSON(http.StatusOK, listOfRecipes)
-}
-
-var recipes []Recipe
+var recipesHandler *handlers.RecipesHandler
+var authHandler *handlers.AuthHandler
 
 func init() {
-	recipes = make([]Recipe, 0)
-	file, _ := ioutil.ReadFile("recipes.json")
-	_ = json.Unmarshal([]byte(file), &recipes)
+	ctx := context.Background()
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(os.Getenv("MONGO_URI")))
+	if err = client.Ping(context.TODO(), readpref.Primary()); err != nil {
+		log.Fatal(err)
+	}
+	log.Println("Connected to MongoDB")
+	collectionRecipes := client.Database(os.Getenv("MONGO_DATABASE")).Collection("recipes")
+
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "",
+		DB:       0,
+	})
+
+	status := redisClient.Ping(ctx)
+	log.Println(status)
+
+	recipesHandler = handlers.NewRecipesHandler(ctx, collectionRecipes, redisClient)
+
+	collectionUsers := client.Database(os.Getenv("MONGO_DATABASE")).Collection("users")
+	authHandler = handlers.NewAuthHandler(ctx, collectionUsers)
+}
+
+func AuthMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// tokenValue := c.GetHeader("Authorization")
+		// claims := &handlers.Claims{}
+		// tkn, err := jwt.ParseWithClaims(tokenValue, claims, func(t *jwt.Token) (interface{}, error) {
+		// 	return []byte(os.Getenv("JWT_SECRET")), nil
+		// })
+		// if err != nil {
+		// 	c.AbortWithStatus(http.StatusUnauthorized)
+		// }
+
+		// if tkn == nil || !tkn.Valid {
+		// 	c.AbortWithStatus(http.StatusUnauthorized)
+		// }
+		session := sessions.Default(c)
+		sessionToken := session.Get("token")
+		if sessionToken == nil {
+			c.JSON(http.StatusForbidden, gin.H{
+				"message": "Not logged",
+			})
+			c.Abort()
+		}
+		c.Next()
+	}
 }
 
 func main() {
 	router := gin.Default()
-	router.POST("/recipes", NewRecipeHandler)
-	router.GET("/recipes", ListRecipesHandler)
-	router.GET("/recipes/search", SearchRecipesHandler)
-	router.PUT("/recipes/:id", UpdateRecipeHandler)
-	router.DELETE("/recipes/:id", DeleteRecipeHandler)
+
+	store, _ := redisStore.NewStore(10, "tcp", "localhost:6379", "", []byte("secret"))
+	router.Use(sessions.Sessions("recipes_api", store))
+	authorized := router.Group("/")
+	authorized.Use(AuthMiddleware())
+	authorized.POST("/recipes", recipesHandler.NewRecipeHandler)
+	authorized.PUT("/recipes/:id",
+		recipesHandler.UpdateRecipeHandler)
+	authorized.DELETE("/recipes/:id",
+		recipesHandler.DeleteRecipeHandler)
+	authorized.GET("/recipes/:id",
+		recipesHandler.GetOneRecipeHandler)
+	// router.POST("/recipes", recipesHandler.NewRecipeHandler)
+	router.GET("/recipes", recipesHandler.ListRecipesHandler)
+	router.POST("/signin", authHandler.SignInHandler)
+	router.POST("/refresh", authHandler.RefreshHandler)
+	router.POST("/signout", authHandler.SignOutHandler)
+	//router.GET("/recipes/search", SearchRecipesHandler)
+	// router.PUT("/recipes/:id", recipesHandler.UpdateRecipeHandler)
+	// router.DELETE("/recipes/:id", recipesHandler.DeleteRecipeHandler)
+	// router.GET("/recipes/:id", recipesHandler.GetOneRecipeHandler)
 	router.Run()
 }
